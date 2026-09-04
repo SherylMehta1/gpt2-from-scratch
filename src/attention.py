@@ -5,24 +5,20 @@ from torch.nn import functional as F
 
 class Head(nn.Module):
     """
-    Single causal self-attention head.
-
-    Each token produces a query, key, and value vector.
-    Queries and keys determine attention weights, while
-    values provide the information that gets aggregated.
+    A single head of causal self-attention.
     """
 
-    def __init__(self, n_embd, head_size, block_size, dropout=0.0):
+    def __init__(self, n_embd, head_size, block_size, dropout):
         super().__init__()
 
-        # Learned projections from token embeddings to
-        # query, key, and value representations.
+        # Independent learned projections for Query, Key, and Value.
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
 
-        # Causal mask: token at position t can only attend
-        # to positions <= t.
+        # Fixed causal mask.
+        # register_buffer ensures the mask moves with the model
+        # when model.to(device) is called, but is not trainable.
         self.register_buffer(
             "tril",
             torch.tril(torch.ones(block_size, block_size))
@@ -30,26 +26,20 @@ class Head(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+        self.head_size = head_size
+
     def forward(self, x):
-        """
-        Args:
-            x: token representations of shape (B, T, C)
-
-        Returns:
-            output: context-aware representations of shape
-                    (B, T, head_size)
-        """
-
         B, T, C = x.shape
 
-        # Project each token into query, key, and value vectors.
+        # Project token representations into Key, Query, and Value spaces.
         k = self.key(x)      # (B, T, head_size)
-        q = self.query(x)   # (B, T, head_size)
-        v = self.value(x)   # (B, T, head_size)
+        q = self.query(x)    # (B, T, head_size)
+        v = self.value(x)    # (B, T, head_size)
 
         # Compute scaled dot-product attention scores.
-        wei = q @ k.transpose(-2, -1)
-        wei = wei * (k.shape[-1] ** -0.5)
+        # (B, T, head_size) @ (B, head_size, T)
+        # -> (B, T, T)
+        wei = q @ k.transpose(-2, -1) * self.head_size**-0.5
 
         # Prevent tokens from attending to future positions.
         wei = wei.masked_fill(
@@ -60,10 +50,64 @@ class Head(nn.Module):
         # Convert scores into attention probabilities.
         wei = F.softmax(wei, dim=-1)
 
-        # Optional dropout on attention weights.
+        # Regularize attention weights during training.
         wei = self.dropout(wei)
 
-        # Weighted aggregation of value vectors.
+        # Weighted aggregation of Value vectors.
         out = wei @ v
+
+        return out
+
+
+class MultiHeadAttention(nn.Module):
+    """
+    Multiple independent self-attention heads running in parallel.
+    """
+
+    def __init__(self, n_embd, n_head, block_size, dropout):
+        super().__init__()
+
+        # Each head operates on a smaller portion of the embedding.
+        assert n_embd % n_head == 0, (
+            "n_embd must be divisible by n_head"
+        )
+
+        head_size = n_embd // n_head
+
+        # Run multiple independent attention heads.
+        self.heads = nn.ModuleList(
+            [
+                Head(
+                    n_embd=n_embd,
+                    head_size=head_size,
+                    block_size=block_size,
+                    dropout=dropout,
+                )
+                for _ in range(n_head)
+            ]
+        )
+
+        # Mix information from all heads after concatenation.
+        self.proj = nn.Linear(n_embd, n_embd)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # Each head produces:
+        # (B, T, head_size)
+        #
+        # Concatenating n_head heads gives:
+        # (B, T, n_head * head_size)
+        # = (B, T, n_embd)
+        out = torch.cat(
+            [head(x) for head in self.heads],
+            dim=-1
+        )
+
+        # Learned projection mixes information across heads.
+        out = self.proj(out)
+
+        # Apply dropout after the projection.
+        out = self.dropout(out)
 
         return out
